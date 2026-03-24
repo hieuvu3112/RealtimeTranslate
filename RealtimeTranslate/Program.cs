@@ -8,6 +8,7 @@ using Whisper.net;
 // ── Cấu hình ────────────────────────────────────────────────────
 const int SampleRate = 16000;
 
+
 // ── VAD (Voice Activity Detection) ──────────────────────────────
 const float VadEnergyThreshold  = 0.01f;            // ngưỡng RMS phát hiện giọng nói
 const int   VadSilenceSamples   = SampleRate * 6 / 10; // 600ms im lặng → kết thúc câu
@@ -77,11 +78,12 @@ using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
 Console.WriteLine("✅ Model đã sẵn sàng.\n");
 
 // ── Diagnostic: test Whisper pipeline với silence ─────────────
-Console.ForegroundColor = ConsoleColor.DarkGray;
-Console.Error.WriteLine("[Startup] Đang kiểm tra pipeline Whisper...");
-Console.ResetColor();
+if (Config.Debug)
 {
-    var silenceTest = new float[SampleRate * 2]; // 2s silence
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.Error.WriteLine("[Startup] Đang kiểm tra pipeline Whisper...");
+    Console.ResetColor();
+    var silenceTest = new float[SampleRate * 2];
     using var silenceWav = BuildWavStream(silenceTest, SampleRate);
     int testCount = 0;
     await foreach (var r in processor.ProcessAsync(silenceWav, CancellationToken.None))
@@ -119,48 +121,70 @@ var processingTask = Task.Run(async () =>
         {
             try
             {
-                float durationSec = segment.Length / (float)SampleRate;
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.Error.WriteLine($"\n[Whisper] ⏳ Đang nhận dạng {durationSec:F1}s audio...");
-                Console.ResetColor();
+                if (Config.Debug)
+                {
+                    float durationSec = segment.Length / (float)SampleRate;
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Error.WriteLine($"\n[Whisper] ⏳ Đang nhận dạng {durationSec:F1}s audio...");
+                    Console.ResetColor();
+                }
 
-                // Bước 1: Whisper transcribe (vi hoặc en tuỳ chế độ)
-                var srcText = new StringBuilder();
+                // Bước 1: Whisper transcribe — in từng phần ngay khi có kết quả
+                var srcText     = new StringBuilder();
+                bool srcStarted = false;
                 using var wavStream = BuildWavStream(segment, SampleRate);
+
                 await foreach (var result in processor.ProcessAsync(wavStream, cts.Token))
                 {
                     string part = result.Text.Trim();
-                    Console.ForegroundColor = ConsoleColor.DarkGray;
-                    Console.Error.WriteLine($"[Whisper] raw: \"{part}\"");
-                    Console.ResetColor();
+                    if (Config.Debug)
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.Error.WriteLine($"[Whisper] raw: \"{part}\"");
+                        Console.ResetColor();
+                    }
+
                     if (!string.IsNullOrWhiteSpace(part))
+                    {
+                        if (!srcStarted)
+                        {
+                            // Bắt đầu dòng nguồn mới
+                            Console.ForegroundColor = isEnToVi ? ConsoleColor.Cyan : ConsoleColor.DarkYellow;
+                            Console.Write($"{srcFlag} ");
+                            Console.ResetColor();
+                            srcStarted = true;
+                        }
+                        // In ngay từng phần — tạo hiệu ứng in dần
+                        Console.ForegroundColor = isEnToVi ? ConsoleColor.Cyan : ConsoleColor.DarkYellow;
+                        Console.Write(part + " ");
+                        Console.ResetColor();
+                        Console.Out.Flush();
                         srcText.Append(part).Append(' ');
+                    }
                 }
 
                 string sourceText = srcText.ToString().Trim();
                 if (string.IsNullOrWhiteSpace(sourceText))
                 {
-                    Console.ForegroundColor = ConsoleColor.DarkGray;
-                    Console.Error.WriteLine("[Whisper] → (kết quả rỗng, bỏ qua)");
-                    Console.ResetColor();
+                    if (srcStarted) Console.WriteLine();
+                    if (Config.Debug)
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.Error.WriteLine("[Whisper] → (kết quả rỗng, bỏ qua)");
+                        Console.ResetColor();
+                    }
                     continue;
                 }
+
+                Console.WriteLine(); // kết thúc dòng nguồn
 
                 // Bước 2: Dịch qua Google Translate
                 string translated = await TranslateAsync(sourceText, srcLang, tgtLang, httpClient, cts.Token);
 
-                // In kết quả
-                Console.WriteLine();
-                Console.ForegroundColor = isEnToVi ? ConsoleColor.Cyan : ConsoleColor.DarkYellow;
-                Console.Write($"{srcFlag} ");
-                Console.ResetColor();
-                Console.WriteLine(sourceText);
-
+                // In bản dịch ngay dưới — không có dòng trống giữa các segment
                 Console.ForegroundColor = isEnToVi ? ConsoleColor.DarkYellow : ConsoleColor.Cyan;
-                Console.Write($"{tgtFlag} ");
+                Console.WriteLine($"{tgtFlag} {translated}");
                 Console.ResetColor();
-                Console.WriteLine(translated);
-                Console.WriteLine();
                 Console.Out.Flush();
             }
             catch (OperationCanceledException) { break; }
@@ -651,10 +675,13 @@ static void ProcessVad(float[] samples, VadState state, BlockingCollection<float
             {
                 state.IsSpeaking = true;
                 state.SpeechBuffer.AddRange(state.PreBuffer);
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.Write($"🎙[rms:{rms:F3}] ");
-                Console.ResetColor();
-                Console.Out.Flush();
+                if (Config.Debug)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write($"🎙[rms:{rms:F3}] ");
+                    Console.ResetColor();
+                    Console.Out.Flush();
+                }
             }
             state.SpeechBuffer.AddRange(samples);
             state.SilenceCount = 0;
@@ -676,9 +703,12 @@ static void ProcessVad(float[] samples, VadState state, BlockingCollection<float
                 state.IsSpeaking   = false;
                 state.SilenceCount = 0;
 
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.Error.WriteLine($"\n[VAD] ✂ Đã cắt {clipSec:F1}s — đưa vào queue (size={queue.Count})");
-                Console.ResetColor();
+                if (Config.Debug)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Error.WriteLine($"\n[VAD] ✂ Đã cắt {clipSec:F1}s — đưa vào queue (size={queue.Count})");
+                    Console.ResetColor();
+                }
 
                 // ── Dump WAV cho lần đầu tiên để debug ───────────
                 if (state.DebugDumpCount < 2)
@@ -708,14 +738,17 @@ static void ProcessVad(float[] samples, VadState state, BlockingCollection<float
         else
         {
             // Log RMS mỗi ~3s khi im lặng để confirm audio đang chạy
-            state.SilenceLogCount += samples.Length;
-            if (state.SilenceLogCount >= SampleRate * 3)
+            if (Config.Debug)
             {
-                state.SilenceLogCount = 0;
-                Console.ForegroundColor = ConsoleColor.DarkGray;
-                Console.Error.Write($"[VAD] rms={rms:F4} ");
-                Console.ResetColor();
-                Console.Out.Flush();
+                state.SilenceLogCount += samples.Length;
+                if (state.SilenceLogCount >= SampleRate * 3)
+                {
+                    state.SilenceLogCount = 0;
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Error.Write($"[VAD] rms={rms:F4} ");
+                    Console.ResetColor();
+                    Console.Out.Flush();
+                }
             }
         }
     }
@@ -730,5 +763,11 @@ sealed class VadState
     public int  SilenceLogCount = 0;
     public int  DebugDumpCount  = 0;
     public bool IsSpeaking      = false;
+}
+
+// ── Cấu hình runtime (bật debug bằng env: TRANSLATE_DEBUG=1) ─────
+static class Config
+{
+    public static readonly bool Debug = Environment.GetEnvironmentVariable("TRANSLATE_DEBUG") == "1";
 }
 

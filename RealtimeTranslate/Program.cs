@@ -111,6 +111,17 @@ if (Config.Debug)
 var processQueue = new BlockingCollection<float[]>(boundedCapacity: 10);
 using var cts    = new CancellationTokenSource();
 
+// ── File lưu kết quả ─────────────────────────────────────────────
+string outputDir  = AppDomain.CurrentDomain.BaseDirectory;
+string outputFile = Path.Combine(outputDir,
+    $"transcript_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{srcLang}-{tgtLang}.txt");
+await using var outputWriter = new StreamWriter(outputFile, append: false, System.Text.Encoding.UTF8)
+    { AutoFlush = true };
+await outputWriter.WriteLineAsync($"# Phiên dịch: {modeDesc}");
+await outputWriter.WriteLineAsync($"# Bắt đầu   : {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+await outputWriter.WriteLineAsync(new string('─', 60));
+Console.WriteLine($"📄 Kết quả sẽ được lưu vào: {outputFile}\n");
+
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
 var processingTask = Task.Run(async () =>
@@ -186,6 +197,11 @@ var processingTask = Task.Run(async () =>
                 Console.WriteLine($"{tgtFlag} {translated}");
                 Console.ResetColor();
                 Console.Out.Flush();
+
+                // Ghi vào file kết quả
+                string timestamp = DateTime.Now.ToString("HH:mm:ss");
+                await outputWriter.WriteLineAsync($"[{timestamp}] {srcFlag} {sourceText}");
+                await outputWriter.WriteLineAsync($"[{timestamp}] {tgtFlag} {translated}");
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -305,7 +321,15 @@ finally
     processQueue.CompleteAdding();
     await processingTask;
     PortAudio.Terminate();
-    Console.WriteLine("\n✅ Đã dừng.");
+
+    // Ghi footer vào file kết quả
+    await outputWriter.WriteLineAsync(new string('─', 60));
+    await outputWriter.WriteLineAsync($"# Kết thúc: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+
+    Console.WriteLine($"\n✅ Đã dừng.");
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.WriteLine($"📄 Kết quả đã lưu: {outputFile}");
+    Console.ResetColor();
 }
 
 // ── Helper: bắt system audio từ AudioCapture (ScreenCaptureKit) ─

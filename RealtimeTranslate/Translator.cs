@@ -127,41 +127,69 @@ sealed class Translator
         string normalized = NormalizeForMt(text);
         Exception? last = null;
 
-        for (int attempt = 0; attempt < 2; attempt++)
+        // Endpoint 1: dict-chrome-ex (ít bị rate-limit 429, hỗ trợ POST câu dài)
+        // Endpoint 2: gtx/single (dự phòng)
+        for (int attempt = 0; attempt < 3; attempt++)
         {
             try
             {
-                string baseUrl = $"https://translate.googleapis.com/translate_a/single?client=gtx&sl={_src}&tl={_tgt}&dt=t";
-                string escaped = Uri.EscapeDataString(normalized);
-                // GET cho câu thường; POST khi câu quá dài (URL > ~2000 ký tự)
-                using var req = escaped.Length < 1800
-                    ? new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}&q={escaped}")
-                    : new HttpRequestMessage(HttpMethod.Post, baseUrl)
-                      {
-                          Content = new FormUrlEncodedContent([new("q", normalized)]),
-                      };
-                using var resp = await _http.SendAsync(req, ct);
-                resp.EnsureSuccessStatusCode();
-                string json = await resp.Content.ReadAsStringAsync(ct);
-
-                // Format: [[["translated","original",...], ...], ...]
-                using var doc = JsonDocument.Parse(json);
-                var sb = new StringBuilder();
-                foreach (var chunk in doc.RootElement[0].EnumerateArray())
-                {
-                    string? part = chunk[0].GetString();
-                    if (!string.IsNullOrEmpty(part)) sb.Append(part);
-                }
-                return sb.ToString();
+                return attempt == 1
+                    ? await GoogleGtxAsync(normalized, ct)
+                    : await GoogleDictAsync(normalized, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 last = ex;
-                await Task.Delay(300, ct);
+                await Task.Delay(400 * (attempt + 1), ct);
             }
         }
         return $"[Translation error: {last?.Message}]";
+    }
+
+    private async Task<string> GoogleDictAsync(string text, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Post,
+            $"https://translate.googleapis.com/translate_a/t?client=dict-chrome-ex&sl={_src}&tl={_tgt}")
+        {
+            Content = new FormUrlEncodedContent([new("q", text)]),
+        };
+        using var resp = await _http.SendAsync(req, ct);
+        resp.EnsureSuccessStatusCode();
+        string json = await resp.Content.ReadAsStringAsync(ct);
+
+        // Format: ["translated"]  hoặc  [["translated","detectedLang"]]
+        using var doc = JsonDocument.Parse(json);
+        var first = doc.RootElement[0];
+        string? result = first.ValueKind == JsonValueKind.Array ? first[0].GetString() : first.GetString();
+        if (string.IsNullOrWhiteSpace(result)) throw new InvalidOperationException("Google trả về rỗng");
+        return result;
+    }
+
+    private async Task<string> GoogleGtxAsync(string text, CancellationToken ct)
+    {
+        string baseUrl = $"https://translate.googleapis.com/translate_a/single?client=gtx&sl={_src}&tl={_tgt}&dt=t";
+        string escaped = Uri.EscapeDataString(text);
+        // GET cho câu thường; POST khi câu quá dài (URL > ~2000 ký tự)
+        using var req = escaped.Length < 1800
+            ? new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}&q={escaped}")
+            : new HttpRequestMessage(HttpMethod.Post, baseUrl)
+              {
+                  Content = new FormUrlEncodedContent([new("q", text)]),
+              };
+        using var resp = await _http.SendAsync(req, ct);
+        resp.EnsureSuccessStatusCode();
+        string json = await resp.Content.ReadAsStringAsync(ct);
+
+        // Format: [[["translated","original",...], ...], ...]
+        using var doc = JsonDocument.Parse(json);
+        var sb = new StringBuilder();
+        foreach (var chunk in doc.RootElement[0].EnumerateArray())
+        {
+            string? part = chunk[0].GetString();
+            if (!string.IsNullOrEmpty(part)) sb.Append(part);
+        }
+        return sb.ToString();
     }
 
     /// <summary>

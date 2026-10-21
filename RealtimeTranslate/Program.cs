@@ -14,7 +14,9 @@ const float VadEnergyThreshold  = 0.01f;            // ngưỡng RMS phát hiệ
 const int   VadSilenceSamples   = SampleRate * 8 / 10; // 800ms im lặng → kết thúc câu (tránh cắt vụn câu)
 const int   VadMinSpeechSamples = SampleRate * 2 / 5; // bỏ qua nếu < 400ms giọng nói thực (chống ảo giác do tiếng ồn)
 const int   VadPreBufferSamples = SampleRate / 2;   // 500ms trước câu (tránh mất âm tiết đầu: "tất nhiên" → "nhiên")
-const int   VadMaxSpeechSamples = SampleRate * 29;  // cắt cứng tối đa ~29s
+const int   VadSoftMaxSamples   = SampleRate * 10;  // sau 10s: cắt ở khoảng nghỉ ngắn đầu tiên
+const int   VadShortPauseSamples = SampleRate / 4;  // khoảng nghỉ ngắn 250ms
+const int   VadMaxSpeechSamples = SampleRate * 15;  // 15s không nghỉ: cắt tại điểm yên tĩnh nhất (< cửa sổ 30s của Whisper)
 const int   VadPaddingSamples   = SampleRate * 3 / 10; // đệm 300ms im lặng 2 đầu clip → Whisper nhận dạng biên tốt hơn
 // ── 1. Đảm bảo model tồn tại và hợp lệ ─────────────────────────
 // (modelPath sẽ được xác định sau khi chọn chế độ)
@@ -78,8 +80,11 @@ var processorBuilder = factory.CreateBuilder()
     .WithTemperatureInc(0.2f)      // fallback khi bị lặp/entropy cao
     .WithEntropyThreshold(2.4f)
     .WithLogProbThreshold(-1.0f);
-processorBuilder.WithBeamSearchSamplingStrategy();
+((BeamSearchSamplingStrategyBuilder)processorBuilder.WithBeamSearchSamplingStrategy()).WithBeamSize(5);
 using var processor  = processorBuilder.Build();
+// PhoWhisper được fine-tune KHÔNG có timestamp; whisper.cpp mặc định giải mã có timestamp
+// → token đầu mỗi clip bị sai ("út những nỗi buồn", "chuyện trăng", "nhân vật…" khi chỉ có nhạc).
+DisableTimestamps(processor);
 using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 var translator = new Translator(httpClient, srcLang, tgtLang);
 Console.WriteLine($"🌐 Bộ dịch: {translator.Description}");
@@ -470,6 +475,29 @@ static float[] ResampleNearest(float[] input, int fromRate, int toRate)
     return output;
 }
 
+// ── Helper: bật no_timestamps (Whisper.net 1.9 không có API công khai) ──
+static void DisableTimestamps(WhisperProcessor processor)
+{
+    try
+    {
+        var field = typeof(WhisperProcessor).GetField("whisperParams",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        object? wp = field?.GetValue(processor);
+        var noTs = wp?.GetType().GetField("NoTimestamps");
+        if (field is null || wp is null || noTs is null)
+            throw new MissingFieldException("WhisperProcessor.whisperParams.NoTimestamps");
+
+        noTs.SetValue(wp, (byte)1);
+        field.SetValue(processor, wp); // struct → phải gán lại
+    }
+    catch (Exception ex)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.Error.WriteLine($"[Whisper] ⚠ Không bật được no_timestamps ({ex.Message}) — độ chính xác từ đầu câu có thể giảm.");
+        Console.ResetColor();
+    }
+}
+
 // ── Helper: đệm im lặng 2 đầu clip ───────────────────────────────
 static float[] PadWithSilence(float[] samples, int padSamples)
 {
@@ -722,67 +750,40 @@ static void ProcessVad(float[] samples, VadState state, BlockingCollection<float
         {
             state.SpeechBuffer.AddRange(samples);
             state.SilenceCount += samples.Length;
+        }
 
+        if (state.IsSpeaking)
+        {
+            int  len       = state.SpeechBuffer.Count;
             bool endOfUtterance = state.SilenceCount >= VadSilenceSamples;
-            bool maxReached     = state.SpeechBuffer.Count >= VadMaxSpeechSamples;
+            // Câu dài liên tục (nói nhanh, nhạc nền): cắt ở khoảng nghỉ ngắn đầu tiên sau 10s
+            bool softCut   = len >= VadSoftMaxSamples && state.SilenceCount >= VadShortPauseSamples;
 
-            if (endOfUtterance || maxReached)
+            if (endOfUtterance || softCut)
             {
                 // Bỏ phần im lặng thừa ở cuối (giữ lại ~200ms) — im lặng dài dễ gây ảo giác
                 int trim = Math.Max(0, state.SilenceCount - SampleRate / 5);
-                if (trim > 0 && trim < state.SpeechBuffer.Count)
-                    state.SpeechBuffer.RemoveRange(state.SpeechBuffer.Count - trim, trim);
+                if (trim > 0 && trim < len)
+                    state.SpeechBuffer.RemoveRange(len - trim, trim);
 
-                float[] clip    = state.SpeechBuffer.ToArray();
-                float   clipSec = clip.Length / (float)SampleRate;
-                int     voiced  = state.VoicedSamples;
+                float[] clip   = state.SpeechBuffer.ToArray();
+                int     voiced = state.VoicedSamples;
                 state.SpeechBuffer.Clear();
                 state.IsSpeaking    = false;
                 state.SilenceCount  = 0;
                 state.VoicedSamples = 0;
-
-                // Tiếng ồn ngắn (tiếng gõ, click, nhạc nền) → bỏ, tránh Whisper "bịa" câu
-                if (voiced < VadMinSpeechSamples)
-                {
-                    if (Config.Debug)
-                    {
-                        Console.ForegroundColor = ConsoleColor.DarkGray;
-                        Console.Error.WriteLine($"\n[VAD] ✗ Bỏ qua {voiced / (float)SampleRate:F2}s giọng nói (quá ngắn)");
-                        Console.ResetColor();
-                    }
-                    return;
-                }
-
-                if (Config.Debug)
-                {
-                    Console.ForegroundColor = ConsoleColor.DarkGray;
-                    Console.Error.WriteLine($"\n[VAD] ✂ Đã cắt {clipSec:F1}s — đưa vào queue (size={queue.Count})");
-                    Console.ResetColor();
-                }
-
-                // ── Dump WAV cho lần đầu tiên để debug ───────────
-                if (state.DebugDumpCount < 2)
-                {
-                    state.DebugDumpCount++;
-                    string wavPath = $"/tmp/debug_segment_{state.DebugDumpCount}.wav";
-                    try
-                    {
-                        using var dumpWav = BuildWavStream(clip, SampleRate);
-                        File.WriteAllBytes(wavPath, dumpWav.ToArray());
-                        Console.ForegroundColor = ConsoleColor.DarkGray;
-                        Console.Error.WriteLine($"[VAD] 💾 Đã lưu segment #{state.DebugDumpCount} → {wavPath}");
-                        Console.Error.WriteLine($"      Kiểm tra bằng: afplay {wavPath}");
-                        Console.ResetColor();
-                    }
-                    catch { /* ignore */ }
-                }
-
-                if (!queue.TryAdd(clip))
-                {
-                    Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.Error.WriteLine("[VAD] ⚠ Queue đầy, bỏ qua segment này.");
-                    Console.ResetColor();
-                }
+                EmitClip(clip, voiced, state, queue);
+            }
+            else if (len >= VadMaxSpeechSamples)
+            {
+                // Không có khoảng nghỉ: cắt tại điểm yên tĩnh nhất trong 4s cuối
+                // (thay vì để Whisper tự chia cửa sổ 30s → cắt ngang từ: "trời" → "chời")
+                int cut = FindQuietestCut(state.SpeechBuffer, len - SampleRate * 4, len - SampleRate / 2);
+                float[] clip = state.SpeechBuffer.GetRange(0, cut).ToArray();
+                state.SpeechBuffer.RemoveRange(0, cut);
+                int voiced = state.VoicedSamples;
+                state.VoicedSamples = state.SpeechBuffer.Count;
+                EmitClip(clip, voiced, state, queue);
             }
         }
         else
@@ -801,6 +802,69 @@ static void ProcessVad(float[] samples, VadState state, BlockingCollection<float
                 }
             }
         }
+    }
+}
+
+// ── Helper: tìm điểm cắt yên tĩnh nhất (cửa sổ 50ms) ─────────────
+static int FindQuietestCut(List<float> buf, int from, int to)
+{
+    const int win = SampleRate / 20;
+    from = Math.Max(win, from);
+    to   = Math.Min(buf.Count - win, to);
+    int   best    = Math.Max(from, Math.Min(to, buf.Count / 2));
+    float bestRms = float.MaxValue;
+    for (int pos = from; pos <= to; pos += win / 2)
+    {
+        float e = 0f;
+        for (int j = pos - win / 2; j < pos + win / 2; j++) e += buf[j] * buf[j];
+        if (e < bestRms) { bestRms = e; best = pos; }
+    }
+    return best;
+}
+
+// ── Helper: đưa clip vào queue (bỏ nếu quá ít giọng nói) ─────────
+static void EmitClip(float[] clip, int voiced, VadState state, BlockingCollection<float[]> queue)
+{
+    float clipSec = clip.Length / (float)SampleRate;
+
+    // Tiếng ồn ngắn (tiếng gõ, click, nhạc nền) → bỏ, tránh Whisper "bịa" câu
+    if (voiced < VadMinSpeechSamples)
+    {
+        if (Config.Debug)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.Error.WriteLine($"\n[VAD] ✗ Bỏ qua {voiced / (float)SampleRate:F2}s giọng nói (quá ngắn)");
+            Console.ResetColor();
+        }
+        return;
+    }
+
+    if (Config.Debug)
+    {
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.Error.WriteLine($"\n[VAD] ✂ Đã cắt {clipSec:F1}s — đưa vào queue (size={queue.Count})");
+        Console.ResetColor();
+
+        // Dump WAV 2 segment đầu để debug
+        if (state.DebugDumpCount < 2)
+        {
+            state.DebugDumpCount++;
+            string wavPath = $"/tmp/debug_segment_{state.DebugDumpCount}.wav";
+            try
+            {
+                using var dumpWav = BuildWavStream(clip, SampleRate);
+                File.WriteAllBytes(wavPath, dumpWav.ToArray());
+                Console.Error.WriteLine($"[VAD] 💾 Đã lưu segment #{state.DebugDumpCount} → {wavPath}  (afplay {wavPath})");
+            }
+            catch { /* ignore */ }
+        }
+    }
+
+    if (!queue.TryAdd(clip))
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.Error.WriteLine("[VAD] ⚠ Queue đầy, bỏ qua segment này.");
+        Console.ResetColor();
     }
 }
 

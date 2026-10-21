@@ -11,10 +11,11 @@ const int SampleRate = 16000;
 
 // ── VAD (Voice Activity Detection) ──────────────────────────────
 const float VadEnergyThreshold  = 0.01f;            // ngưỡng RMS phát hiện giọng nói
-const int   VadSilenceSamples   = SampleRate * 6 / 10; // 600ms im lặng → kết thúc câu
-const int   VadMinSpeechSamples = SampleRate / 4;   // bỏ qua nếu < 250ms speech (giảm từ 500ms)
-const int   VadPreBufferSamples = SampleRate / 5;   // 200ms trước câu (tránh cắt đầu chữ)
+const int   VadSilenceSamples   = SampleRate * 8 / 10; // 800ms im lặng → kết thúc câu (tránh cắt vụn câu)
+const int   VadMinSpeechSamples = SampleRate * 2 / 5; // bỏ qua nếu < 400ms giọng nói thực (chống ảo giác do tiếng ồn)
+const int   VadPreBufferSamples = SampleRate / 2;   // 500ms trước câu (tránh mất âm tiết đầu: "tất nhiên" → "nhiên")
 const int   VadMaxSpeechSamples = SampleRate * 29;  // cắt cứng tối đa ~29s
+const int   VadPaddingSamples   = SampleRate * 3 / 10; // đệm 300ms im lặng 2 đầu clip → Whisper nhận dạng biên tốt hơn
 // ── 1. Đảm bảo model tồn tại và hợp lệ ─────────────────────────
 // (modelPath sẽ được xác định sau khi chọn chế độ)
 
@@ -71,10 +72,17 @@ catch (Exception ex) when (ex is WhisperModelLoadException || ex.Message.Contain
 using var _ = factory;
 var processorBuilder = factory.CreateBuilder()
     .WithLanguage(srcLang)         // vi hoặc en tuỳ chế độ
-    .WithNoSpeechThreshold(0.9f);
+    .WithNoSpeechThreshold(0.6f)
+    .WithProbabilities()
+    .WithTemperature(0f)
+    .WithTemperatureInc(0.2f)      // fallback khi bị lặp/entropy cao
+    .WithEntropyThreshold(2.4f)
+    .WithLogProbThreshold(-1.0f);
 processorBuilder.WithBeamSearchSamplingStrategy();
 using var processor  = processorBuilder.Build();
-using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+var translator = new Translator(httpClient, srcLang, tgtLang);
+Console.WriteLine($"🌐 Bộ dịch: {translator.Description}");
 Console.WriteLine("✅ Model đã sẵn sàng.\n");
 
 // ── Diagnostic: test Whisper pipeline với silence ─────────────
@@ -143,16 +151,27 @@ var processingTask = Task.Run(async () =>
                 // Bước 1: Whisper transcribe — in từng phần ngay khi có kết quả
                 var srcText     = new StringBuilder();
                 bool srcStarted = false;
-                using var wavStream = BuildWavStream(segment, SampleRate);
+                using var wavStream = BuildWavStream(PadWithSilence(segment, VadPaddingSamples), SampleRate);
 
                 await foreach (var result in processor.ProcessAsync(wavStream, cts.Token))
                 {
-                    string part = result.Text.Trim();
+                    string part = TextCleaner.Clean(result.Text);
                     if (Config.Debug)
                     {
                         Console.ForegroundColor = ConsoleColor.DarkGray;
-                        Console.Error.WriteLine($"[Whisper] raw: \"{part}\"");
+                        Console.Error.WriteLine($"[Whisper] raw: \"{result.Text.Trim()}\" p={result.Probability:F2} noSpeech={result.NoSpeechProbability:F2}");
                         Console.ResetColor();
+                    }
+
+                    if (TextCleaner.IsLikelyHallucination(part, result.Probability, result.NoSpeechProbability))
+                    {
+                        if (Config.Debug)
+                        {
+                            Console.ForegroundColor = ConsoleColor.DarkGray;
+                            Console.Error.WriteLine("[Whisper] → bỏ qua (nghi ngờ ảo giác / độ tin cậy thấp)");
+                            Console.ResetColor();
+                        }
+                        continue;
                     }
 
                     if (!string.IsNullOrWhiteSpace(part))
@@ -174,7 +193,7 @@ var processingTask = Task.Run(async () =>
                     }
                 }
 
-                string sourceText = srcText.ToString().Trim();
+                string sourceText = TextCleaner.Clean(srcText.ToString());
                 if (string.IsNullOrWhiteSpace(sourceText))
                 {
                     if (srcStarted) Console.WriteLine();
@@ -189,8 +208,8 @@ var processingTask = Task.Run(async () =>
 
                 Console.WriteLine(); // kết thúc dòng nguồn
 
-                // Bước 2: Dịch qua Google Translate
-                string translated = await TranslateAsync(sourceText, srcLang, tgtLang, httpClient, cts.Token);
+                // Bước 2: Dịch (LLM có ngữ cảnh nếu được cấu hình, nếu không dùng Google Translate)
+                string translated = await translator.TranslateAsync(sourceText, cts.Token);
 
                 // In bản dịch ngay dưới — không có dòng trống giữa các segment
                 Console.ForegroundColor = isEnToVi ? ConsoleColor.DarkYellow : ConsoleColor.Cyan;
@@ -306,7 +325,7 @@ try
         {
             float[]? remaining;
             lock (vs.SpeechBuffer)
-                remaining = vs.SpeechBuffer.Count > VadMinSpeechSamples
+                remaining = vs.VoicedSamples >= VadMinSpeechSamples
                     ? vs.SpeechBuffer.ToArray() : null;
             if (remaining != null) processQueue.TryAdd(remaining);
         }
@@ -431,7 +450,9 @@ static async Task CaptureSystemAudioAsync(
     }
 }
 
-// ── Helper: resample nearest-neighbour ───────────────────────────
+// ── Helper: resample với lọc thông thấp (box filter) để tránh aliasing ──
+// 48k → 16k: lấy trung bình mỗi cửa sổ thay vì lấy mẫu gần nhất (nearest-neighbour
+// gây méo tiếng — đặc biệt hại cho phụ âm/thanh điệu tiếng Việt).
 static float[] ResampleNearest(float[] input, int fromRate, int toRate)
 {
     if (fromRate == toRate) return input;
@@ -439,8 +460,22 @@ static float[] ResampleNearest(float[] input, int fromRate, int toRate)
     int    outLen = (int)(input.Length / ratio);
     var    output = new float[outLen];
     for (int i = 0; i < outLen; i++)
-        output[i] = input[(int)(i * ratio)];
+    {
+        int start = (int)(i * ratio);
+        int end   = Math.Min(input.Length, Math.Max(start + 1, (int)((i + 1) * ratio)));
+        float sum = 0f;
+        for (int j = start; j < end; j++) sum += input[j];
+        output[i] = sum / (end - start);
+    }
     return output;
+}
+
+// ── Helper: đệm im lặng 2 đầu clip ───────────────────────────────
+static float[] PadWithSilence(float[] samples, int padSamples)
+{
+    var padded = new float[samples.Length + padSamples * 2];
+    Array.Copy(samples, 0, padded, padSamples, samples.Length);
+    return padded;
 }
 
 // ── Helper: tạo WAV in-memory từ mảng float PCM 16-bit ──────────
@@ -544,34 +579,6 @@ static async Task EnsureModelAsync(string modelPath, long modelMinBytes = 1_500L
 
     throw new FileNotFoundException("Model GGML chưa được tạo. Xem hướng dẫn ở trên.");
 }
-
-// ── Helper: dịch tiếng Việt → tiếng Anh (Google Translate) ──────
-static async Task<string> TranslateAsync(
-    string text, string srcLang, string tgtLang,
-    HttpClient http, CancellationToken ct = default)
-{
-    // Google Translate unofficial endpoint — không cần API key
-    string url = "https://translate.googleapis.com/translate_a/single"
-               + $"?client=gtx&sl={srcLang}&tl={tgtLang}&dt=t&q={Uri.EscapeDataString(text)}";
-    try
-    {
-        string json = await http.GetStringAsync(url, ct);
-        // Format: [[["translated","original",...], ...], ...]
-        using var doc = JsonDocument.Parse(json);
-        var sb = new StringBuilder();
-        foreach (var chunk in doc.RootElement[0].EnumerateArray())
-        {
-            string? part = chunk[0].GetString();
-            if (!string.IsNullOrEmpty(part)) sb.Append(part);
-        }
-        return sb.ToString();
-    }
-    catch (Exception ex)
-    {
-        return $"[Translation error: {ex.Message}]";
-    }
-}
-
 
 // ── Helper: liệt kê & chọn thiết bị audio input ─────────────────
 // Trả về: (danh sách PortAudio device index, dùng ScreenCaptureKit hay không)
@@ -708,24 +715,43 @@ static void ProcessVad(float[] samples, VadState state, BlockingCollection<float
                 }
             }
             state.SpeechBuffer.AddRange(samples);
-            state.SilenceCount = 0;
+            state.SilenceCount   = 0;
+            state.VoicedSamples += samples.Length;
         }
         else if (state.IsSpeaking)
         {
             state.SpeechBuffer.AddRange(samples);
             state.SilenceCount += samples.Length;
 
-            bool endOfUtterance = state.SilenceCount >= VadSilenceSamples
-                                  && state.SpeechBuffer.Count >= VadMinSpeechSamples;
+            bool endOfUtterance = state.SilenceCount >= VadSilenceSamples;
             bool maxReached     = state.SpeechBuffer.Count >= VadMaxSpeechSamples;
 
             if (endOfUtterance || maxReached)
             {
+                // Bỏ phần im lặng thừa ở cuối (giữ lại ~200ms) — im lặng dài dễ gây ảo giác
+                int trim = Math.Max(0, state.SilenceCount - SampleRate / 5);
+                if (trim > 0 && trim < state.SpeechBuffer.Count)
+                    state.SpeechBuffer.RemoveRange(state.SpeechBuffer.Count - trim, trim);
+
                 float[] clip    = state.SpeechBuffer.ToArray();
                 float   clipSec = clip.Length / (float)SampleRate;
+                int     voiced  = state.VoicedSamples;
                 state.SpeechBuffer.Clear();
-                state.IsSpeaking   = false;
-                state.SilenceCount = 0;
+                state.IsSpeaking    = false;
+                state.SilenceCount  = 0;
+                state.VoicedSamples = 0;
+
+                // Tiếng ồn ngắn (tiếng gõ, click, nhạc nền) → bỏ, tránh Whisper "bịa" câu
+                if (voiced < VadMinSpeechSamples)
+                {
+                    if (Config.Debug)
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.Error.WriteLine($"\n[VAD] ✗ Bỏ qua {voiced / (float)SampleRate:F2}s giọng nói (quá ngắn)");
+                        Console.ResetColor();
+                    }
+                    return;
+                }
 
                 if (Config.Debug)
                 {
@@ -784,6 +810,7 @@ sealed class VadState
     public readonly List<float>  SpeechBuffer = new();
     public readonly Queue<float> PreBuffer    = new();
     public int  SilenceCount    = 0;
+    public int  VoicedSamples   = 0;
     public int  SilenceLogCount = 0;
     public int  DebugDumpCount  = 0;
     public bool IsSpeaking      = false;

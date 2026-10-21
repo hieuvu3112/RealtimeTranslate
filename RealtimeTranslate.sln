@@ -2,6 +2,10 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RealtimeTranslate", "RealtimeTranslate\RealtimeTranslate.csproj", "{47C8BEAD-DCED-4C50-AC52-170274F76EA5}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BookTranslate", "BookTranslate\BookTranslate.csproj", "{2BE1C11A-8496-4F68-A902-059A332C4249}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DemoGemini", "DemoGemini\DemoGemini.csproj", "{22CB2D36-02BF-4D29-9991-37C0F466CD56}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -12,5 +16,13 @@ Global
 		{47C8BEAD-DCED-4C50-AC52-170274F76EA5}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{47C8BEAD-DCED-4C50-AC52-170274F76EA5}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{47C8BEAD-DCED-4C50-AC52-170274F76EA5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2BE1C11A-8496-4F68-A902-059A332C4249}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2BE1C11A-8496-4F68-A902-059A332C4249}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2BE1C11A-8496-4F68-A902-059A332C4249}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2BE1C11A-8496-4F68-A902-059A332C4249}.Release|Any CPU.Build.0 = Release|Any CPU
+		{22CB2D36-02BF-4D29-9991-37C0F466CD56}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{22CB2D36-02BF-4D29-9991-37C0F466CD56}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{22CB2D36-02BF-4D29-9991-37C0F466CD56}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{22CB2D36-02BF-4D29-9991-37C0F466CD56}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
